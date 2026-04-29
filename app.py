@@ -182,12 +182,12 @@ def handle_image(event):
     today = now.strftime("%Y-%m-%d")
 
     # 測試期間暫時關閉重複打卡檢查，測完後再開啟
-    # if already_checked_in_today(user_id):
-    #     line_bot_api.reply_message(
-    #         event.reply_token,
-    #         TextSendMessage(text="你今天已經打過卡囉 ✅")
-    #     )
-    #     return
+    if already_checked_in_today(user_id):
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="你今天已經打過卡囉 ✅")
+        )
+       return
 
     display_name = get_display_name(user_id)
     work_hour, work_minute = get_user_work_time(user_id)
@@ -223,7 +223,7 @@ def handle_image(event):
             f"罰你跑步 💥{km}公里💥\n"
             f"給我在 {(now + timedelta(days=2)).strftime('%Y/%m/%d')} 前跑完！\n"
             f"\n"
-            f"跑完請回覆「我跑完了」\n"
+            f"跑完請回覆「跑完 X」\n"
             f"否則晚一天多3K👻"
         )
 
