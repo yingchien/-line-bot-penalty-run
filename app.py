@@ -340,7 +340,7 @@ def handle_text(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
     # 回報跑步
-    elif text.startswith("跑完"):
+    elif any(text.startswith(kw) for kw in ["跑完", "完成", "結束", "done"]):
         import re
         match = re.search(r"[\d.]+", text)
         if not match:
