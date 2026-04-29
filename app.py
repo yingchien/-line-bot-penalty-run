@@ -187,7 +187,7 @@ def handle_image(event):
             event.reply_token,
             TextSendMessage(text="你今天已經打過卡囉 ✅")
         )
-       return
+        return
 
     display_name = get_display_name(user_id)
     work_hour, work_minute = get_user_work_time(user_id)
