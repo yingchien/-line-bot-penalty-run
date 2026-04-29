@@ -221,7 +221,7 @@ def handle_image(event):
             f"\n"
             f"你是遲到仔 🫵🏻 今天晚到 {late_minutes} 分鐘\n"
             f"罰你跑步 💥{km}公里💥\n"
-            f"給我在（{(now + timedelta(days=2))} 前）跑完！\n"
+            f"給我在 {(now + timedelta(days=2)).strftime('%Y/%m/%d')} 前跑完！\n"
             f"\n"
             f"跑完請回覆「我跑完了」\n"
             f"否則晚一天多3K👻"
