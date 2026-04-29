@@ -279,7 +279,132 @@ def handle_text(event):
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
+# 顯示所有成員
+    if text in ["成員", "所有成員", "成員列表"]:
+        with get_db() as db:
+            rows = db.execute(
+                "SELECT DISTINCT display_name FROM checkins ORDER BY display_name"
+            ).fetchall()
+        if not rows:
+            reply = "目前還沒有任何打卡紀錄 📭"
+        else:
+            lines = ["👥 有紀錄的成員："]
+            for r in rows:
+                lines.append(f"・{r['display_name']}")
+            reply = "\n".join(lines)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
 
+    # 我的打卡紀錄
+    if text in ["我的紀錄", "打卡紀錄", "紀錄"]:
+        weekday_map = ["一", "二", "三", "四", "五", "六", "日"]
+        with get_db() as db:
+            rows = db.execute(
+                """SELECT checkin_time, late_minutes, km_owed
+                   FROM checkins
+                   WHERE user_id=?
+                   ORDER BY checkin_time DESC
+                   LIMIT 10""",
+                (user_id,)
+            ).fetchall()
+        if not rows:
+            reply = "你還沒有任何打卡紀錄 📭"
+        else:
+            lines = ["📋 你的近10次打卡紀錄："]
+            for r in rows:
+                dt = datetime.fromisoformat(r["checkin_time"])
+                weekday = weekday_map[dt.weekday()]
+                time_str = dt.strftime(f"%m/%d(週{weekday}) %H:%M:%S")
+                if r["late_minutes"] == 0:
+                    status = "✅ 準時"
+                else:
+                    status = f"🕐 遲到 {r['late_minutes']} 分／罰 {r['km_owed']:.1f}K"
+                lines.append(f"・{time_str}　{status}")
+            reply = "\n".join(lines)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    # 手動調整打卡時間
+    if text.startswith("補打卡") or text.startswith("調整打卡"):
+        import re
+        match = re.search(r"(\d{1,2}):(\d{2})", text)
+        if not match:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="請輸入格式：補打卡 HH:MM\n例如：補打卡 09:05\n\n限上班時間後 1 小時內")
+            )
+            return
+
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        now = datetime.now(TZ) if 'TZ' in globals() else datetime.now()
+        work_hour, work_minute = get_user_work_time(user_id)
+
+        # 建立指定時間（今天）
+        target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        work_start = now.replace(hour=work_hour, minute=work_minute, second=0, microsecond=0)
+        limit_time = work_start + timedelta(hours=1)
+
+        # 必須在上班時間到上班後1小時之間
+        if not (work_start <= target_time <= limit_time):
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text=f"❌ 補打卡時間不在允許範圍內\n"
+                         f"只能填寫 {work_start.strftime('%H:%M')} ~ {limit_time.strftime('%H:%M')} 之間的時間"
+                )
+            )
+            return
+
+        # 若今天已有打卡紀錄則更新，否則新增
+        today = now.strftime("%Y-%m-%d")
+        late_seconds = (target_time - work_start).total_seconds()
+        late_minutes = max(0, int(late_seconds / 60))
+        km = calc_km(late_minutes)
+        deadline = (now + timedelta(days=2)).isoformat() if km > 0 else None
+        display_name = get_display_name(user_id)
+
+        with get_db() as db:
+            existing = db.execute(
+                "SELECT id FROM checkins WHERE user_id=? AND date=?",
+                (user_id, today)
+            ).fetchone()
+
+            if existing:
+                db.execute(
+                    """UPDATE checkins
+                       SET checkin_time=?, late_minutes=?, km_owed=?, deadline=?, completed=?
+                       WHERE id=?""",
+                    (target_time.isoformat(), late_minutes, km, deadline, 0 if km > 0 else 1, existing["id"])
+                )
+            else:
+                db.execute(
+                    """INSERT INTO checkins
+                       (user_id, display_name, checkin_time, late_minutes, km_owed, deadline, completed, date)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (user_id, display_name, target_time.isoformat(), late_minutes, km, deadline, 0 if km > 0 else 1, today)
+                )
+            db.commit()
+
+        if late_minutes == 0:
+            reply = (
+                f"✅ {display_name} 補打卡成功！\n"
+                f"—— {target_time.strftime('%H:%M:%S')} ——\n\n"
+                f"今天也是準時上班的社畜 🦦"
+            )
+        else:
+            reply = (
+                f"🛎️ {display_name} 補打卡成功！\n"
+                f"—— {target_time.strftime('%H:%M:%S')} ——\n\n"
+                f"你是遲到仔 🫵🏻 今天晚到 {late_minutes} 分鐘\n"
+                f"罰你跑步 💥{km}公里💥\n"
+                f"給我在 {(now + timedelta(days=2)).strftime('%Y/%m/%d')} 前跑完！\n\n"
+                f"跑完請回覆「跑完 X」\n"
+                f"否則晚一天多3K👻"
+            )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+        
     # 查欠債
     if text in ["欠債", "我的欠債", "查詢"]:
         debts = get_pending_debt(user_id)
@@ -325,10 +450,12 @@ def handle_text(event):
         reply = (
             "📖 打卡罰跑機器人\n\n"
             "【打卡】傳任何照片\n"
-            "【回報跑步】傳跑步 App 截圖 + 輸入「跑完 X」\n\n"
+            "【補打卡】補打卡 HH:MM（限上班後1小時內）\n\n"
             "【基本指令】\n"
             "・欠債 → 查自己的罰跑狀況\n"
             "・排行 → 全員欠債排名\n"
+            "・成員 → 查看所有有紀錄的成員\n"
+            "・我的紀錄 → 近10次打卡紀錄\n"
             "・說明 → 顯示此說明\n\n"
             "【個人設定】\n"
             "・上班時間 HH:MM → 設定自己的上班時間（例：上班時間 9:30）\n"
