@@ -1,5 +1,5 @@
 import os
-import json
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from flask import Flask, request, abort
@@ -7,7 +7,7 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, ImageMessage, TextMessage,
-    TextSendMessage, ImageSendMessage
+    TextSendMessage
 )
 
 app = Flask(__name__)
@@ -20,6 +20,17 @@ WORK_START_MINUTE = int(os.environ.get("WORK_START_MINUTE", "0"))
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+try:
+    import pytz
+    TZ = pytz.timezone("Asia/Taipei")
+except ImportError:
+    TZ = None
+
+def now_tw():
+    if TZ:
+        return datetime.now(TZ).replace(tzinfo=None)
+    return datetime.now()
+
 # --- DB Setup ----------------------------------------------------------------
 
 def get_db():
@@ -31,15 +42,15 @@ def init_db():
     with get_db() as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS checkins (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     TEXT NOT NULL,
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      TEXT NOT NULL,
                 display_name TEXT,
                 checkin_time TEXT NOT NULL,
                 late_minutes INTEGER NOT NULL DEFAULT 0,
-                km_owed     REAL NOT NULL DEFAULT 0,
-                deadline    TEXT,
-                completed   INTEGER NOT NULL DEFAULT 0,
-                date        TEXT NOT NULL
+                km_owed      REAL NOT NULL DEFAULT 0,
+                deadline     TEXT,
+                completed    INTEGER NOT NULL DEFAULT 0,
+                date         TEXT NOT NULL
             )
         """)
         db.execute("""
@@ -54,11 +65,11 @@ def init_db():
         """)
         db.execute("""
             CREATE TABLE IF NOT EXISTS user_settings (
-                user_id     TEXT PRIMARY KEY,
+                user_id           TEXT PRIMARY KEY,
                 work_start_hour   INTEGER NOT NULL DEFAULT 9,
                 work_start_minute INTEGER NOT NULL DEFAULT 0,
-                display_name TEXT,
-                created_at  TEXT NOT NULL
+                display_name      TEXT,
+                created_at        TEXT NOT NULL
             )
         """)
         db.commit()
@@ -72,9 +83,14 @@ def calc_km(late_minutes):
         return 0
     return min(late_minutes, 15)
 
-def get_display_name(user_id):
+def get_display_name(user_id, source=None):
     try:
-        profile = line_bot_api.get_profile(user_id)
+        if source and source.type == "group":
+            profile = line_bot_api.get_group_member_profile(source.group_id, user_id)
+        elif source and source.type == "room":
+            profile = line_bot_api.get_room_member_profile(source.room_id, user_id)
+        else:
+            profile = line_bot_api.get_profile(user_id)
         return profile.display_name
     except Exception:
         return "成員"
@@ -85,24 +101,23 @@ def get_user_work_time(user_id):
             "SELECT work_start_hour, work_start_minute FROM user_settings WHERE user_id=?",
             (user_id,)
         ).fetchone()
-        if row:
-            return row["work_start_hour"], row["work_start_minute"]
-        else:
-            return WORK_START_HOUR, WORK_START_MINUTE
+    if row:
+        return row["work_start_hour"], row["work_start_minute"]
+    return WORK_START_HOUR, WORK_START_MINUTE
 
-def set_user_work_time(user_id, hour, minute):
-    display_name = get_display_name(user_id)
+def set_user_work_time(user_id, hour, minute, source=None):
+    display_name = get_display_name(user_id, source)
     with get_db() as db:
         db.execute(
             """INSERT OR REPLACE INTO user_settings
                (user_id, work_start_hour, work_start_minute, display_name, created_at)
                VALUES (?, ?, ?, ?, ?)""",
-            (user_id, hour, minute, display_name, datetime.now().isoformat())
+            (user_id, hour, minute, display_name, now_tw().isoformat())
         )
         db.commit()
 
 def get_today():
-    return datetime.now().strftime("%Y-%m-%d")
+    return now_tw().strftime("%Y-%m-%d")
 
 def already_checked_in_today(user_id):
     today = get_today()
@@ -127,7 +142,7 @@ def get_pending_debt(user_id):
     return rows
 
 def check_overdue_and_penalize():
-    now = datetime.now().isoformat()
+    now = now_tw().isoformat()
     with get_db() as db:
         overdue = db.execute(
             """SELECT c.id, c.user_id, c.km_owed, c.display_name,
@@ -142,7 +157,7 @@ def check_overdue_and_penalize():
         for row in overdue:
             remaining = row["km_owed"] - row["km_done"]
             if remaining > 0:
-                new_deadline = (datetime.now() + timedelta(days=2)).isoformat()
+                new_deadline = (now_tw() + timedelta(days=2)).isoformat()
                 new_km = row["km_owed"] + 3
                 db.execute(
                     "UPDATE checkins SET km_owed=?, deadline=? WHERE id=?",
@@ -178,18 +193,18 @@ def callback():
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
     user_id = event.source.user_id
-    now = datetime.now()
+    now = now_tw()
     today = now.strftime("%Y-%m-%d")
 
     # 測試期間暫時關閉重複打卡檢查，測完後再開啟
-    if already_checked_in_today(user_id):
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="你今天已經打過卡囉 ✅")
-        )
-        return
+    # if already_checked_in_today(user_id):
+    #     line_bot_api.reply_message(
+    #         event.reply_token,
+    #         TextSendMessage(text="你今天已經打過卡囉 ✅")
+    #     )
+    #     return
 
-    display_name = get_display_name(user_id)
+    display_name = get_display_name(user_id, event.source)
     work_hour, work_minute = get_user_work_time(user_id)
     work_start = now.replace(hour=work_hour, minute=work_minute, second=0, microsecond=0)
     late_seconds = (now - work_start).total_seconds()
@@ -209,20 +224,16 @@ def handle_image(event):
     if late_minutes == 0:
         reply = (
             f"✅ {display_name} 打卡成功！\n"
-            f"—— {now.strftime('%H:%M:%S')} ——\n"
-            f"\n"
+            f"—— {now.strftime('%H:%M:%S')} ——\n\n"
             f"今天也是準時上班的社畜 🦦"
         )
     else:
-        km = calc_km(late_minutes)
         reply = (
             f"🛎️ {display_name} 打卡成功！\n"
-            f"—— {now.strftime('%H:%M:%S')} ——\n"
-            f"\n"
+            f"—— {now.strftime('%H:%M:%S')} ——\n\n"
             f"你是遲到仔 🫵🏻 今天晚到 {late_minutes} 分鐘\n"
             f"罰你跑步 💥{km}公里💥\n"
-            f"給我在 {(now + timedelta(days=2)).strftime('%Y/%m/%d')} 前跑完！\n"
-            f"\n"
+            f"給我在 {(now + timedelta(days=2)).strftime('%Y/%m/%d')} 前跑完！\n\n"
             f"跑完請回覆「跑完 X」\n"
             f"否則晚一天多3K👻"
         )
@@ -239,7 +250,6 @@ def handle_text(event):
 
     # 設定上班時間
     if text.startswith("上班時間") or text.startswith("設定上班時間"):
-        import re
         match = re.search(r"(\d{1,2})[:\s時](\d{1,2})", text)
         if not match:
             line_bot_api.reply_message(
@@ -247,19 +257,16 @@ def handle_text(event):
                 TextSendMessage(text="請輸入正確的格式：\n例如「上班時間 9:30」或「上班時間 9 30」\n\n(小時數需在 0-23，分鐘數在 0-59)")
             )
             return
-
         hour = int(match.group(1))
         minute = int(match.group(2))
-
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(text="❌ 時間格式不對！\n小時數：0-23\n分鐘數：0-59")
             )
             return
-
-        set_user_work_time(user_id, hour, minute)
-        display_name = get_display_name(user_id)
+        set_user_work_time(user_id, hour, minute, event.source)
+        display_name = get_display_name(user_id, event.source)
         reply = (
             f"✅ {display_name} 的上班時間已設定\n"
             f"⏰ {hour:02d}:{minute:02d}\n\n"
@@ -271,7 +278,7 @@ def handle_text(event):
     # 查看上班時間設定
     if text in ["我的設定", "我的上班時間", "查看設定"]:
         hour, minute = get_user_work_time(user_id)
-        display_name = get_display_name(user_id)
+        display_name = get_display_name(user_id, event.source)
         reply = (
             f"📋 {display_name} 的上班時間設定\n"
             f"⏰ {hour:02d}:{minute:02d}\n\n"
@@ -279,7 +286,8 @@ def handle_text(event):
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
-# 顯示所有成員
+
+    # 顯示所有成員
     if text in ["成員", "所有成員", "成員列表"]:
         with get_db() as db:
             rows = db.execute(
@@ -324,9 +332,8 @@ def handle_text(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
-    # 手動調整打卡時間
+    # 補打卡
     if text.startswith("補打卡") or text.startswith("調整打卡"):
-        import re
         match = re.search(r"(\d{1,2}):(\d{2})", text)
         if not match:
             line_bot_api.reply_message(
@@ -337,15 +344,13 @@ def handle_text(event):
 
         hour = int(match.group(1))
         minute = int(match.group(2))
-        now = datetime.now(TZ) if 'TZ' in globals() else datetime.now()
+        now = now_tw()
         work_hour, work_minute = get_user_work_time(user_id)
 
-        # 建立指定時間（今天）
         target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         work_start = now.replace(hour=work_hour, minute=work_minute, second=0, microsecond=0)
         limit_time = work_start + timedelta(hours=1)
 
-        # 必須在上班時間到上班後1小時之間
         if not (work_start <= target_time <= limit_time):
             line_bot_api.reply_message(
                 event.reply_token,
@@ -356,20 +361,18 @@ def handle_text(event):
             )
             return
 
-        # 若今天已有打卡紀錄則更新，否則新增
         today = now.strftime("%Y-%m-%d")
         late_seconds = (target_time - work_start).total_seconds()
         late_minutes = max(0, int(late_seconds / 60))
         km = calc_km(late_minutes)
         deadline = (now + timedelta(days=2)).isoformat() if km > 0 else None
-        display_name = get_display_name(user_id)
+        display_name = get_display_name(user_id, event.source)
 
         with get_db() as db:
             existing = db.execute(
                 "SELECT id FROM checkins WHERE user_id=? AND date=?",
                 (user_id, today)
             ).fetchone()
-
             if existing:
                 db.execute(
                     """UPDATE checkins
@@ -404,7 +407,7 @@ def handle_text(event):
             )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
-        
+
     # 查欠債
     if text in ["欠債", "我的欠債", "查詢"]:
         debts = get_pending_debt(user_id)
@@ -421,9 +424,10 @@ def handle_text(event):
             lines.append(f"\n總計剩餘：{total_remaining:.1f} K")
             reply = "\n".join(lines)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
 
     # 全員欠債排行
-    elif text in ["排行", "欠債排行", "誰欠最多"]:
+    if text in ["排行", "欠債排行", "誰欠最多"]:
         with get_db() as db:
             rows = db.execute(
                 """SELECT c.display_name,
@@ -444,9 +448,10 @@ def handle_text(event):
                 lines.append(f"{medal} {r['display_name']}：{max(0, r['remaining']):.1f} K")
             reply = "\n".join(lines)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
 
     # 說明
-    elif text in ["說明", "help", "Help", "指令"]:
+    if text in ["說明", "help", "Help", "指令"]:
         reply = (
             "📖 打卡罰跑機器人\n\n"
             "【打卡】傳任何照片\n"
@@ -465,10 +470,10 @@ def handle_text(event):
             "・2天內跑完，逾期 +3K\n"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
 
     # 回報跑步
-    elif any(text.startswith(kw) for kw in ["跑完", "完成", "結束", "done"]):
-        import re
+    if any(text.startswith(kw) for kw in ["跑完", "完成", "結束", "done"]):
         match = re.search(r"[\d.]+", text)
         if not match:
             line_bot_api.reply_message(
@@ -487,12 +492,10 @@ def handle_text(event):
             return
 
         oldest = debts[0]
-        remaining_before = max(0, oldest["km_owed"] - oldest["km_done"])
-
         with get_db() as db:
             db.execute(
                 "INSERT INTO run_reports (checkin_id, user_id, report_time, km_reported) VALUES (?, ?, ?, ?)",
-                (oldest["id"], user_id, datetime.now().isoformat(), km_done)
+                (oldest["id"], user_id, now_tw().isoformat(), km_done)
             )
             new_done = oldest["km_done"] + km_done
             if new_done >= oldest["km_owed"]:
@@ -500,7 +503,7 @@ def handle_text(event):
             db.commit()
 
         remaining_after = max(0, oldest["km_owed"] - new_done)
-        display_name = get_display_name(user_id)
+        display_name = get_display_name(user_id, event.source)
 
         if remaining_after <= 0:
             reply = (
@@ -513,6 +516,7 @@ def handle_text(event):
                 f"這筆還剩 {remaining_after:.1f} K，繼續加油！"
             )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
 
 # --- Main --------------------------------------------------------------------
 
