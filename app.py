@@ -517,7 +517,14 @@ def handle_text(event):
             )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
-
+# --- 清除測試資料 -------------------------------------------------------------------
+@app.route("/reset-test-data")
+def reset_test_data():
+    with get_db() as db:
+        db.execute("DELETE FROM checkins")
+        db.execute("DELETE FROM run_reports")
+        db.commit()
+    return "清除完成 ✅"
 # --- Main --------------------------------------------------------------------
 
 if __name__ == "__main__":
