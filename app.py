@@ -1,6 +1,7 @@
 import os
 import re
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from datetime import datetime, timedelta
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
@@ -16,6 +17,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 WORK_START_HOUR = int(os.environ.get("WORK_START_HOUR", "9"))
 WORK_START_MINUTE = int(os.environ.get("WORK_START_MINUTE", "0"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -34,45 +36,45 @@ def now_tw():
 # --- DB Setup ----------------------------------------------------------------
 
 def get_db():
-    conn = sqlite3.connect("checkin.db")
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     return conn
 
 def init_db():
-    with get_db() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS checkins (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id      TEXT NOT NULL,
-                display_name TEXT,
-                checkin_time TEXT NOT NULL,
-                late_minutes INTEGER NOT NULL DEFAULT 0,
-                km_owed      REAL NOT NULL DEFAULT 0,
-                deadline     TEXT,
-                completed    INTEGER NOT NULL DEFAULT 0,
-                date         TEXT NOT NULL
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS run_reports (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                checkin_id  INTEGER NOT NULL,
-                user_id     TEXT NOT NULL,
-                report_time TEXT NOT NULL,
-                km_reported REAL NOT NULL DEFAULT 0,
-                FOREIGN KEY (checkin_id) REFERENCES checkins(id)
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS user_settings (
-                user_id           TEXT PRIMARY KEY,
-                work_start_hour   INTEGER NOT NULL DEFAULT 9,
-                work_start_minute INTEGER NOT NULL DEFAULT 0,
-                display_name      TEXT,
-                created_at        TEXT NOT NULL
-            )
-        """)
-        db.commit()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS checkins (
+                    id           SERIAL PRIMARY KEY,
+                    user_id      TEXT NOT NULL,
+                    display_name TEXT,
+                    checkin_time TEXT NOT NULL,
+                    late_minutes INTEGER NOT NULL DEFAULT 0,
+                    km_owed      REAL NOT NULL DEFAULT 0,
+                    deadline     TEXT,
+                    completed    INTEGER NOT NULL DEFAULT 0,
+                    date         TEXT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS run_reports (
+                    id          SERIAL PRIMARY KEY,
+                    checkin_id  INTEGER NOT NULL,
+                    user_id     TEXT NOT NULL,
+                    report_time TEXT NOT NULL,
+                    km_reported REAL NOT NULL DEFAULT 0,
+                    FOREIGN KEY (checkin_id) REFERENCES checkins(id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id           TEXT PRIMARY KEY,
+                    work_start_hour   INTEGER NOT NULL DEFAULT 9,
+                    work_start_minute INTEGER NOT NULL DEFAULT 0,
+                    display_name      TEXT,
+                    created_at        TEXT NOT NULL
+                )
+            """)
+        conn.commit()
 
 init_db()
 
@@ -96,74 +98,87 @@ def get_display_name(user_id, source=None):
         return "成員"
 
 def get_user_work_time(user_id):
-    with get_db() as db:
-        row = db.execute(
-            "SELECT work_start_hour, work_start_minute FROM user_settings WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT work_start_hour, work_start_minute FROM user_settings WHERE user_id=%s",
+                (user_id,)
+            )
+            row = cur.fetchone()
     if row:
         return row["work_start_hour"], row["work_start_minute"]
     return WORK_START_HOUR, WORK_START_MINUTE
 
 def set_user_work_time(user_id, hour, minute, source=None):
     display_name = get_display_name(user_id, source)
-    with get_db() as db:
-        db.execute(
-            """INSERT OR REPLACE INTO user_settings
-               (user_id, work_start_hour, work_start_minute, display_name, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (user_id, hour, minute, display_name, now_tw().isoformat())
-        )
-        db.commit()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO user_settings
+                   (user_id, work_start_hour, work_start_minute, display_name, created_at)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (user_id) DO UPDATE
+                   SET work_start_hour=%s, work_start_minute=%s, display_name=%s""",
+                (user_id, hour, minute, display_name, now_tw().isoformat(),
+                 hour, minute, display_name)
+            )
+        conn.commit()
 
 def get_today():
     return now_tw().strftime("%Y-%m-%d")
 
 def already_checked_in_today(user_id):
     today = get_today()
-    with get_db() as db:
-        row = db.execute(
-            "SELECT id FROM checkins WHERE user_id=? AND date=?",
-            (user_id, today)
-        ).fetchone()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM checkins WHERE user_id=%s AND date=%s",
+                (user_id, today)
+            )
+            row = cur.fetchone()
     return row is not None
 
 def get_pending_debt(user_id):
-    with get_db() as db:
-        rows = db.execute(
-            """SELECT c.id, c.km_owed, c.deadline, c.date,
-                      COALESCE(SUM(r.km_reported), 0) as km_done
-               FROM checkins c
-               LEFT JOIN run_reports r ON r.checkin_id = c.id
-               WHERE c.user_id=? AND c.completed=0 AND c.km_owed > 0
-               GROUP BY c.id""",
-            (user_id,)
-        ).fetchall()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT c.id, c.km_owed, c.deadline, c.date,
+                          COALESCE(SUM(r.km_reported), 0) as km_done
+                   FROM checkins c
+                   LEFT JOIN run_reports r ON r.checkin_id = c.id
+                   WHERE c.user_id=%s AND c.completed=0 AND c.km_owed > 0
+                   GROUP BY c.id, c.km_owed, c.deadline, c.date""",
+                (user_id,)
+            )
+            rows = cur.fetchall()
     return rows
 
 def check_overdue_and_penalize():
     now = now_tw().isoformat()
-    with get_db() as db:
-        overdue = db.execute(
-            """SELECT c.id, c.user_id, c.km_owed, c.display_name,
-                      COALESCE(SUM(r.km_reported), 0) as km_done
-               FROM checkins c
-               LEFT JOIN run_reports r ON r.checkin_id = c.id
-               WHERE c.completed=0 AND c.km_owed > 0 AND c.deadline < ?
-               GROUP BY c.id""",
-            (now,)
-        ).fetchall()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT c.id, c.user_id, c.km_owed, c.display_name,
+                          COALESCE(SUM(r.km_reported), 0) as km_done
+                   FROM checkins c
+                   LEFT JOIN run_reports r ON r.checkin_id = c.id
+                   WHERE c.completed=0 AND c.km_owed > 0 AND c.deadline < %s
+                   GROUP BY c.id, c.user_id, c.km_owed, c.display_name""",
+                (now,)
+            )
+            overdue = cur.fetchall()
 
         for row in overdue:
             remaining = row["km_owed"] - row["km_done"]
             if remaining > 0:
                 new_deadline = (now_tw() + timedelta(days=2)).isoformat()
                 new_km = row["km_owed"] + 3
-                db.execute(
-                    "UPDATE checkins SET km_owed=?, deadline=? WHERE id=?",
-                    (new_km, new_deadline, row["id"])
-                )
-                db.commit()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE checkins SET km_owed=%s, deadline=%s WHERE id=%s",
+                        (new_km, new_deadline, row["id"])
+                    )
+                conn.commit()
                 try:
                     line_bot_api.push_message(
                         row["user_id"],
@@ -196,7 +211,6 @@ def handle_image(event):
     now = now_tw()
     today = now.strftime("%Y-%m-%d")
 
-    # 測試期間暫時關閉重複打卡檢查，測完再開啟
     if already_checked_in_today(user_id):
         line_bot_api.reply_message(
             event.reply_token,
@@ -212,14 +226,15 @@ def handle_image(event):
     km = calc_km(late_minutes)
     deadline = (now + timedelta(days=2)).isoformat() if km > 0 else None
 
-    with get_db() as db:
-        db.execute(
-            """INSERT INTO checkins
-               (user_id, display_name, checkin_time, late_minutes, km_owed, deadline, completed, date)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (user_id, display_name, now.isoformat(), late_minutes, km, deadline, 0 if km > 0 else 1, today)
-        )
-        db.commit()
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO checkins
+                   (user_id, display_name, checkin_time, late_minutes, km_owed, deadline, completed, date)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                (user_id, display_name, now.isoformat(), late_minutes, km, deadline, 0 if km > 0 else 1, today)
+            )
+        conn.commit()
 
     if late_minutes == 0:
         reply = (
@@ -289,10 +304,10 @@ def handle_text(event):
 
     # 顯示所有成員
     if text in ["成員", "所有成員", "成員列表"]:
-        with get_db() as db:
-            rows = db.execute(
-                "SELECT DISTINCT display_name FROM checkins ORDER BY display_name"
-            ).fetchall()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT display_name FROM checkins ORDER BY display_name")
+                rows = cur.fetchall()
         if not rows:
             reply = "目前還沒有任何打卡紀錄 📭"
         else:
@@ -306,15 +321,17 @@ def handle_text(event):
     # 我的打卡紀錄
     if text in ["我的紀錄", "打卡紀錄", "紀錄"]:
         weekday_map = ["一", "二", "三", "四", "五", "六", "日"]
-        with get_db() as db:
-            rows = db.execute(
-                """SELECT checkin_time, late_minutes, km_owed
-                   FROM checkins
-                   WHERE user_id=?
-                   ORDER BY checkin_time DESC
-                   LIMIT 10""",
-                (user_id,)
-            ).fetchall()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT checkin_time, late_minutes, km_owed
+                       FROM checkins
+                       WHERE user_id=%s
+                       ORDER BY checkin_time DESC
+                       LIMIT 10""",
+                    (user_id,)
+                )
+                rows = cur.fetchall()
         if not rows:
             reply = "你還沒有任何打卡紀錄 📭"
         else:
@@ -368,26 +385,28 @@ def handle_text(event):
         deadline = (now + timedelta(days=2)).isoformat() if km > 0 else None
         display_name = get_display_name(user_id, event.source)
 
-        with get_db() as db:
-            existing = db.execute(
-                "SELECT id FROM checkins WHERE user_id=? AND date=?",
-                (user_id, today)
-            ).fetchone()
-            if existing:
-                db.execute(
-                    """UPDATE checkins
-                       SET checkin_time=?, late_minutes=?, km_owed=?, deadline=?, completed=?
-                       WHERE id=?""",
-                    (target_time.isoformat(), late_minutes, km, deadline, 0 if km > 0 else 1, existing["id"])
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM checkins WHERE user_id=%s AND date=%s",
+                    (user_id, today)
                 )
-            else:
-                db.execute(
-                    """INSERT INTO checkins
-                       (user_id, display_name, checkin_time, late_minutes, km_owed, deadline, completed, date)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (user_id, display_name, target_time.isoformat(), late_minutes, km, deadline, 0 if km > 0 else 1, today)
-                )
-            db.commit()
+                existing = cur.fetchone()
+                if existing:
+                    cur.execute(
+                        """UPDATE checkins
+                           SET checkin_time=%s, late_minutes=%s, km_owed=%s, deadline=%s, completed=%s
+                           WHERE id=%s""",
+                        (target_time.isoformat(), late_minutes, km, deadline, 0 if km > 0 else 1, existing["id"])
+                    )
+                else:
+                    cur.execute(
+                        """INSERT INTO checkins
+                           (user_id, display_name, checkin_time, late_minutes, km_owed, deadline, completed, date)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (user_id, display_name, target_time.isoformat(), late_minutes, km, deadline, 0 if km > 0 else 1, today)
+                    )
+            conn.commit()
 
         if late_minutes == 0:
             reply = (
@@ -428,16 +447,18 @@ def handle_text(event):
 
     # 全員欠債排行
     if text in ["排行", "欠債排行", "誰欠最多"]:
-        with get_db() as db:
-            rows = db.execute(
-                """SELECT c.display_name,
-                          SUM(c.km_owed) - COALESCE(SUM(r.km_reported), 0) as remaining
-                   FROM checkins c
-                   LEFT JOIN run_reports r ON r.checkin_id = c.id
-                   WHERE c.completed=0 AND c.km_owed > 0
-                   GROUP BY c.user_id
-                   ORDER BY remaining DESC"""
-            ).fetchall()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT c.display_name,
+                              SUM(c.km_owed) - COALESCE(SUM(r.km_reported), 0) as remaining
+                       FROM checkins c
+                       LEFT JOIN run_reports r ON r.checkin_id = c.id
+                       WHERE c.completed=0 AND c.km_owed > 0
+                       GROUP BY c.user_id, c.display_name
+                       ORDER BY remaining DESC"""
+                )
+                rows = cur.fetchall()
         if not rows:
             reply = "目前大家都沒有未完成的罰跑 🎉"
         else:
@@ -492,15 +513,16 @@ def handle_text(event):
             return
 
         oldest = debts[0]
-        with get_db() as db:
-            db.execute(
-                "INSERT INTO run_reports (checkin_id, user_id, report_time, km_reported) VALUES (?, ?, ?, ?)",
-                (oldest["id"], user_id, now_tw().isoformat(), km_done)
-            )
-            new_done = oldest["km_done"] + km_done
-            if new_done >= oldest["km_owed"]:
-                db.execute("UPDATE checkins SET completed=1 WHERE id=?", (oldest["id"],))
-            db.commit()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO run_reports (checkin_id, user_id, report_time, km_reported) VALUES (%s, %s, %s, %s)",
+                    (oldest["id"], user_id, now_tw().isoformat(), km_done)
+                )
+                new_done = oldest["km_done"] + km_done
+                if new_done >= oldest["km_owed"]:
+                    cur.execute("UPDATE checkins SET completed=1 WHERE id=%s", (oldest["id"],))
+            conn.commit()
 
         remaining_after = max(0, oldest["km_owed"] - new_done)
         display_name = get_display_name(user_id, event.source)
@@ -517,14 +539,7 @@ def handle_text(event):
             )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
-# --- 清除測試資料 -------------------------------------------------------------------
-@app.route("/reset-test-data")
-def reset_test_data():
-    with get_db() as db:
-        db.execute("DELETE FROM checkins")
-        db.execute("DELETE FROM run_reports")
-        db.commit()
-    return "清除完成 ✅"
+
 # --- Main --------------------------------------------------------------------
 
 if __name__ == "__main__":
