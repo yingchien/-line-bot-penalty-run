@@ -1,5 +1,6 @@
 import os
 import re
+import requests
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timedelta
@@ -18,6 +19,9 @@ LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 WORK_START_HOUR = int(os.environ.get("WORK_START_HOUR", "9"))
 WORK_START_MINUTE = int(os.environ.get("WORK_START_MINUTE", "0"))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
+NOTION_CHECKIN_DB = os.environ.get("NOTION_CHECKIN_DB", "")
+NOTION_RUN_DB = os.environ.get("NOTION_RUN_DB", "")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -33,6 +37,99 @@ def now_tw():
         return datetime.now(TZ).replace(tzinfo=None)
     return datetime.now()
 
+# --- Notion ------------------------------------------------------------------
+
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Content-Type": "application/json",
+    "Notion-Version": "2022-06-28"
+}
+
+def notion_add_checkin(display_name, checkin_time, late_minutes, km_owed, deadline, date):
+    """新增一筆打卡紀錄到 Notion"""
+    if not NOTION_TOKEN or not NOTION_CHECKIN_DB:
+        return None
+    props = {
+        "Name": {
+            "title": [{"text": {"content": display_name}}]
+        },
+        "打卡時間": {
+            "date": {"start": checkin_time}
+        },
+        "遲到分鐘": {
+            "number": late_minutes
+        },
+        "罰跑K數": {
+            "number": km_owed
+        },
+        "完成": {
+            "checkbox": km_owed == 0
+        },
+        "日期": {
+            "rich_text": [{"text": {"content": date}}]
+        }
+    }
+    if deadline:
+        props["截止日"] = {"date": {"start": deadline[:10]}}
+
+    try:
+        resp = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=NOTION_HEADERS,
+            json={"parent": {"database_id": NOTION_CHECKIN_DB}, "properties": props},
+            timeout=5
+        )
+        data = resp.json()
+        return data.get("id")  # 回傳 Notion page id，之後跑步回報會用到
+    except Exception:
+        return None
+
+def notion_complete_checkin(notion_page_id):
+    """把打卡紀錄標記為完成"""
+    if not NOTION_TOKEN or not notion_page_id:
+        return
+    try:
+        requests.patch(
+            f"https://api.notion.com/v1/pages/{notion_page_id}",
+            headers=NOTION_HEADERS,
+            json={"properties": {"完成": {"checkbox": True}}},
+            timeout=5
+        )
+    except Exception:
+        pass
+
+def notion_add_run_report(display_name, report_time, km_done, notion_checkin_page_id):
+    """新增一筆跑步回報到 Notion"""
+    if not NOTION_TOKEN or not NOTION_RUN_DB:
+        return
+    props = {
+        "Name": {
+            "title": [{"text": {"content": display_name}}]
+        },
+        "回報時間": {
+            "date": {"start": report_time}
+        },
+        "跑了幾K": {
+            "number": km_done
+        },
+        "user_id": {
+            "rich_text": [{"text": {"content": display_name}}]
+        }
+    }
+    if notion_checkin_page_id:
+        props["對應打卡"] = {
+            "relation": [{"id": notion_checkin_page_id}]
+        }
+    try:
+        requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=NOTION_HEADERS,
+            json={"parent": {"database_id": NOTION_RUN_DB}, "properties": props},
+            timeout=5
+        )
+    except Exception:
+        pass
+
 # --- DB Setup ----------------------------------------------------------------
 
 def get_db():
@@ -44,15 +141,16 @@ def init_db():
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS checkins (
-                    id           SERIAL PRIMARY KEY,
-                    user_id      TEXT NOT NULL,
-                    display_name TEXT,
-                    checkin_time TEXT NOT NULL,
-                    late_minutes INTEGER NOT NULL DEFAULT 0,
-                    km_owed      REAL NOT NULL DEFAULT 0,
-                    deadline     TEXT,
-                    completed    INTEGER NOT NULL DEFAULT 0,
-                    date         TEXT NOT NULL
+                    id                  SERIAL PRIMARY KEY,
+                    user_id             TEXT NOT NULL,
+                    display_name        TEXT,
+                    checkin_time        TEXT NOT NULL,
+                    late_minutes        INTEGER NOT NULL DEFAULT 0,
+                    km_owed             REAL NOT NULL DEFAULT 0,
+                    deadline            TEXT,
+                    completed           INTEGER NOT NULL DEFAULT 0,
+                    date                TEXT NOT NULL,
+                    notion_page_id      TEXT
                 )
             """)
             cur.execute("""
@@ -73,6 +171,10 @@ def init_db():
                     display_name      TEXT,
                     created_at        TEXT NOT NULL
                 )
+            """)
+            # 如果舊資料表沒有 notion_page_id 欄位，補上去
+            cur.execute("""
+                ALTER TABLE checkins ADD COLUMN IF NOT EXISTS notion_page_id TEXT
             """)
         conn.commit()
 
@@ -142,12 +244,12 @@ def get_pending_debt(user_id):
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT c.id, c.km_owed, c.deadline, c.date,
+                """SELECT c.id, c.km_owed, c.deadline, c.date, c.notion_page_id,
                           COALESCE(SUM(r.km_reported), 0) as km_done
                    FROM checkins c
                    LEFT JOIN run_reports r ON r.checkin_id = c.id
                    WHERE c.user_id=%s AND c.completed=0 AND c.km_owed > 0
-                   GROUP BY c.id, c.km_owed, c.deadline, c.date""",
+                   GROUP BY c.id, c.km_owed, c.deadline, c.date, c.notion_page_id""",
                 (user_id,)
             )
             rows = cur.fetchall()
@@ -226,13 +328,24 @@ def handle_image(event):
     km = calc_km(late_minutes)
     deadline = (now + timedelta(days=2)).isoformat() if km > 0 else None
 
+    # 寫入 Notion
+    notion_page_id = notion_add_checkin(
+        display_name=display_name,
+        checkin_time=now.isoformat(),
+        late_minutes=late_minutes,
+        km_owed=km,
+        deadline=deadline,
+        date=today
+    )
+
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO checkins
-                   (user_id, display_name, checkin_time, late_minutes, km_owed, deadline, completed, date)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                (user_id, display_name, now.isoformat(), late_minutes, km, deadline, 0 if km > 0 else 1, today)
+                   (user_id, display_name, checkin_time, late_minutes, km_owed, deadline, completed, date, notion_page_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (user_id, display_name, now.isoformat(), late_minutes, km, deadline,
+                 0 if km > 0 else 1, today, notion_page_id)
             )
         conn.commit()
 
@@ -388,11 +501,28 @@ def handle_text(event):
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id FROM checkins WHERE user_id=%s AND date=%s",
+                    "SELECT id, notion_page_id FROM checkins WHERE user_id=%s AND date=%s",
                     (user_id, today)
                 )
                 existing = cur.fetchone()
                 if existing:
+                    # 更新 Notion
+                    if existing["notion_page_id"]:
+                        try:
+                            requests.patch(
+                                f"https://api.notion.com/v1/pages/{existing['notion_page_id']}",
+                                headers=NOTION_HEADERS,
+                                json={"properties": {
+                                    "打卡時間": {"date": {"start": target_time.isoformat()}},
+                                    "遲到分鐘": {"number": late_minutes},
+                                    "罰跑K數": {"number": km},
+                                    "完成": {"checkbox": km == 0},
+                                    **({"截止日": {"date": {"start": deadline[:10]}}} if deadline else {})
+                                }},
+                                timeout=5
+                            )
+                        except Exception:
+                            pass
                     cur.execute(
                         """UPDATE checkins
                            SET checkin_time=%s, late_minutes=%s, km_owed=%s, deadline=%s, completed=%s
@@ -400,11 +530,20 @@ def handle_text(event):
                         (target_time.isoformat(), late_minutes, km, deadline, 0 if km > 0 else 1, existing["id"])
                     )
                 else:
+                    notion_page_id = notion_add_checkin(
+                        display_name=display_name,
+                        checkin_time=target_time.isoformat(),
+                        late_minutes=late_minutes,
+                        km_owed=km,
+                        deadline=deadline,
+                        date=today
+                    )
                     cur.execute(
                         """INSERT INTO checkins
-                           (user_id, display_name, checkin_time, late_minutes, km_owed, deadline, completed, date)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                        (user_id, display_name, target_time.isoformat(), late_minutes, km, deadline, 0 if km > 0 else 1, today)
+                           (user_id, display_name, checkin_time, late_minutes, km_owed, deadline, completed, date, notion_page_id)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (user_id, display_name, target_time.isoformat(), late_minutes, km, deadline,
+                         0 if km > 0 else 1, today, notion_page_id)
                     )
             conn.commit()
 
@@ -513,6 +652,8 @@ def handle_text(event):
             return
 
         oldest = debts[0]
+        display_name = get_display_name(user_id, event.source)
+
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -520,12 +661,24 @@ def handle_text(event):
                     (oldest["id"], user_id, now_tw().isoformat(), km_done)
                 )
                 new_done = oldest["km_done"] + km_done
-                if new_done >= oldest["km_owed"]:
+                is_completed = new_done >= oldest["km_owed"]
+                if is_completed:
                     cur.execute("UPDATE checkins SET completed=1 WHERE id=%s", (oldest["id"],))
             conn.commit()
 
+        # 寫入 Notion 跑步回報
+        notion_add_run_report(
+            display_name=display_name,
+            report_time=now_tw().isoformat(),
+            km_done=km_done,
+            notion_checkin_page_id=oldest.get("notion_page_id")
+        )
+
+        # 如果完成，把 Notion 打卡紀錄標記完成
+        if is_completed and oldest.get("notion_page_id"):
+            notion_complete_checkin(oldest["notion_page_id"])
+
         remaining_after = max(0, oldest["km_owed"] - new_done)
-        display_name = get_display_name(user_id, event.source)
 
         if remaining_after <= 0:
             reply = (
