@@ -98,6 +98,20 @@ def notion_complete_checkin(notion_page_id):
     except Exception:
         pass
 
+def notion_delete_page(notion_page_id):
+    """在 Notion 中刪除（封存）特定頁面"""
+    if not NOTION_TOKEN or not notion_page_id:
+        return
+    try:
+        requests.patch(
+            f"https://api.notion.com/v1/pages/{notion_page_id}",
+            headers=NOTION_HEADERS,
+            json={"archived": True},
+            timeout=5
+        )
+    except Exception:
+        pass
+
 def notion_add_run_report(display_name, report_time, km_done, notion_checkin_page_id):
     """新增一筆跑步回報到 Notion"""
     if not NOTION_TOKEN or not NOTION_RUN_DB:
@@ -376,6 +390,45 @@ def handle_text(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
 
+    # 重置今天打卡資料
+    if text == "重置今天":
+        today = get_today()
+        display_name = get_display_name(user_id, event.source)
+        
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # 1. 查找今天該使用者是否有打卡紀錄
+                cur.execute(
+                    "SELECT id, notion_page_id FROM checkins WHERE user_id=%s AND date=%s ORDER BY id DESC LIMIT 1",
+                    (user_id, today)
+                )
+                row = cur.fetchone()
+                
+                if not row:
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        TextSendMessage(text="🤷‍♂️ 你今天本來就沒有打卡紀錄喔！")
+                    )
+                    return
+                
+                checkin_id = row["id"]
+                notion_page_id = row["notion_page_id"]
+                
+                # 2. 先刪除 run_reports 相關關聯跑步回報 (避免外鍵約束錯誤)
+                cur.execute("DELETE FROM run_reports WHERE checkin_id=%s", (checkin_id,))
+                
+                # 3. 刪除打卡紀錄
+                cur.execute("DELETE FROM checkins WHERE id=%s", (checkin_id,))
+            conn.commit()
+            
+        # 4. 同步將 Notion 打卡資料刪除 (移至垃圾桶)
+        if notion_page_id:
+            notion_delete_page(notion_page_id)
+            
+        reply = f"🗑️ 已成功重置 {display_name} 今日的打卡紀錄與跑步回報！你現在可以重新傳照片打卡了。"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
     # 設定上班時間
     if text.startswith("上班時間") or text.startswith("設定上班時間"):
         match = re.search(r"(\d{1,2})[:\s時](\d{1,2})", text)
@@ -422,7 +475,7 @@ def handle_text(event):
                 cur.execute("SELECT DISTINCT display_name FROM checkins ORDER BY display_name")
                 rows = cur.fetchall()
         if not rows:
-            reply = "目前還沒有任何打卡紀錄 📭"
+            reply = "目還沒有任何打卡紀錄 📭"
         else:
             lines = ["👥 有紀錄的成員："]
             for r in rows:
@@ -457,7 +510,7 @@ def handle_text(event):
                     status = "✅ 準時"
                 else:
                     status = f"🕐 遲到 {r['late_minutes']} 分／罰 {r['km_owed']:.1f}K"
-                lines.append(f"・{time_str}　{status}")
+                lines.append(f"・{time_str} {status}")
             reply = "\n".join(lines)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
@@ -615,7 +668,8 @@ def handle_text(event):
         reply = (
             "📖 打卡罰跑機器人\n\n"
             "【打卡】傳任何照片\n"
-            "【補打卡】補打卡 HH:MM（限上班後1小時內）\n\n"
+            "【補打卡】補打卡 HH:MM（限上班後1小時內）\n"
+            "【重置今天】清除自己當天的打卡與跑步紀錄\n\n"
             "【基本指令】\n"
             "・欠債 → 查自己的罰跑狀況\n"
             "・排行 → 全員欠債排名\n"
@@ -628,6 +682,7 @@ def handle_text(event):
             "【規則】\n"
             "・遲到幾分 = 跑幾K（最多15K）\n"
             "・2天內跑完，逾期 +3K\n"
+            "（若要徹底清除某天錯誤資料可輸入「重置今天」）"
         )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
